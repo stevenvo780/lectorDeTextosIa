@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lector de Textos IA</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background: #f8f9fa; }
+        .container { max-width: 600px; margin-top: 40px; }
+        .audio-part { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+<div class="container shadow rounded p-4 bg-white">
+    <h2 class="mb-3">Lector de Textos con IA</h2>
+    <form id="textForm">
+        <div class="mb-3">
+            <textarea class="form-control" id="textInput" rows="6" placeholder="Pega tu texto aquí..."></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">Reproducir</button>
+    </form>
+    <div id="audioContainer" class="mt-4"></div>
+    <div class="d-flex justify-content-between align-items-center mt-2">
+        <div>
+            <button id="cancelBtn" class="btn btn-danger btn-sm">Cancelar</button>
+            <button id="pauseBtn" class="btn btn-secondary btn-sm ms-2">Pausar</button>
+            <button id="resumeBtn" class="btn btn-secondary btn-sm ms-2" style="display:none;">Reanudar</button>
+        </div>
+        <button id="exportBtn" class="btn btn-success btn-sm">Exportar</button>
+    </div>
+</div>
+<script>
+const form = document.getElementById('textForm');
+const textInput = document.getElementById('textInput');
+const audioContainer = document.getElementById('audioContainer');
+let cancelRequested = false;
+const cancelBtn = document.getElementById('cancelBtn');
+const exportBtn = document.getElementById('exportBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+let isPaused = false;
+let audioElem = null;
+
+cancelBtn.onclick = async () => {
+    cancelRequested = true;
+    audioContainer.innerHTML = '<div class="text-secondary">Lectura cancelada.</div>';
+    await fetch('/clear_cache', { method: 'POST' });
+};
+
+exportBtn.onclick = async () => {
+    exportBtn.disabled = true;
+    const originalText = exportBtn.innerHTML;
+    exportBtn.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Exportando...`;
+    const res = await fetch('/export_all', { method: 'POST' });
+    const data = await res.json();
+    exportBtn.disabled = false;
+    exportBtn.innerHTML = originalText;
+    if (data.export_url) {
+        const a = document.createElement('a');
+        a.href = data.export_url;
+        a.download = 'lectura_completa.mp3';
+        a.click();
+    }
+};
+
+pauseBtn.onclick = () => {
+    if (audioElem && !audioElem.paused) {
+        audioElem.pause();
+        isPaused = true;
+        pauseBtn.style.display = 'none';
+        resumeBtn.style.display = '';
+    }
+};
+
+resumeBtn.onclick = () => {
+    if (audioElem && isPaused) {
+        audioElem.play();
+        isPaused = false;
+        pauseBtn.style.display = '';
+        resumeBtn.style.display = 'none';
+    }
+};
+
+form.onsubmit = async (e) => {
+    e.preventDefault();
+    cancelRequested = false;
+    isPaused = false;
+    pauseBtn.style.display = '';
+    resumeBtn.style.display = 'none';
+    audioContainer.innerHTML = '';
+    await fetch('/clear_cache', { method: 'POST' }); // Limpia antes de iniciar
+    const text = textInput.value;
+    // Solicita las URLs de audio por partes
+    const res = await fetch('/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+    let current = 0;
+    const audios = data.audio_urls;
+    audioElem = document.getElementById('mainAudio');
+    if (!audioElem) {
+        audioElem = document.createElement('audio');
+        audioElem.id = 'mainAudio';
+        audioElem.controls = true;
+        audioElem.style.width = '100%';
+        audioContainer.appendChild(audioElem);
+    }
+    async function waitForAudio(url) {
+        for (let i = 0; i < 60; i++) { // espera hasta 30 segundos
+            if (cancelRequested) return false;
+            const resp = await fetch(url, { method: 'HEAD' });
+            if (resp.ok) return true;
+            await new Promise(r => setTimeout(r, 500));
+        }
+        return false;
+    }
+    async function playNext() {
+        if (cancelRequested) return;
+        if (current < audios.length) {
+            audioContainer.insertAdjacentHTML('beforeend', `<div id='loadingMsg' class='text-secondary'>Cargando parte ${current+1}...</div>`);
+            const url = audios[current];
+            const ready = await waitForAudio(url);
+            document.getElementById('loadingMsg')?.remove();
+            if (ready) {
+                audioElem.src = url;
+                audioElem.play();
+            } else {
+                audioContainer.insertAdjacentHTML('beforeend', `<div class='text-danger'>No se pudo cargar el audio.</div>`);
+            }
+        }
+    }
+    audioElem.onended = async () => {
+        if (isPaused) return;
+        // Borra el audio anterior del servidor
+        if (current < audios.length) {
+            await fetch('/delete_audio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: audios[current] })
+            });
+        }
+        current++;
+        playNext();
+    };
+    playNext();
+};
+</script>
+</body>
+</html>
