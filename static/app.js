@@ -245,7 +245,29 @@ form.onsubmit = async (e) => {
         return;
     }
     updateStatus('Procesando texto...');
-    textParts = getPartsFromText(text);
+    // 1. Pedir fragmentos reales al backend
+    let splitData;
+    try {
+        const splitRes = await fetch('/split', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+        });
+        splitData = await splitRes.json();
+    } catch (err) {
+        showError('Error de conexión con el servidor (split).');
+        updateStatus('Error de conexión.');
+        textInput.readOnly = false;
+        return;
+    }
+    if (!splitData.parts || !splitData.parts.length) {
+        showError('No se pudo dividir el texto.');
+        updateStatus('No se pudo dividir el texto.');
+        textInput.readOnly = false;
+        return;
+    }
+    textParts = splitData.parts;
+    // 2. Pedir los audios usando el texto original (el backend usará la misma lógica)
     let data;
     try {
         const res = await fetch('/tts', {
