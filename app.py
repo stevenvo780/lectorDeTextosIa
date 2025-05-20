@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file, abort, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_file, abort
 import os
 import threading
 import uuid
@@ -11,12 +11,13 @@ from werkzeug.utils import secure_filename
 import tempfile
 import fitz  # PyMuPDF
 import time
+import re
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'audio_cache'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Cola para borrar archivos después de exportar
+# --- Utilidades de limpieza y manejo de archivos ---
 cleanup_queue = Queue()
 
 def cleanup_worker():
@@ -29,15 +30,25 @@ def cleanup_worker():
             pass
         cleanup_queue.task_done()
 
-# Inicia el hilo de limpieza al arrancar la app
 Thread(target=cleanup_worker, daemon=True).start()
 
-# Divide el texto en partes (puedes mejorar el split según tu preferencia)
+def clean_old_files(max_age=3600):
+    """Elimina archivos .mp3 antiguos en el cache."""
+    now = time.time()
+    for f in os.listdir(UPLOAD_FOLDER):
+        if f.endswith('.mp3'):
+            path = os.path.join(UPLOAD_FOLDER, f)
+            try:
+                if os.path.getmtime(path) < now - max_age:
+                    os.remove(path)
+            except Exception:
+                pass
+
+# --- Utilidades de texto y TTS ---
 def split_text(text, max_length=300):
-    import re
+    """Divide el texto en partes manejables para TTS."""
     sentences = re.split(r'(?<=[.!?]) +', text)
-    parts = []
-    current = ''
+    parts, current = [], ''
     for s in sentences:
         if len(current) + len(s) < max_length:
             current += ' ' + s
@@ -56,6 +67,7 @@ async def tts_edge(text, filename):
 def generate_audio_async(text, filename):
     asyncio.run(tts_edge(text, filename))
 
+# --- Rutas Flask ---
 @app.before_request
 def before_request():
     clean_old_files()
@@ -67,12 +79,9 @@ def index():
 @app.route('/split', methods=['POST'])
 def split():
     text = request.json.get('text', '')
-    # Mejorar split: separar por títulos markdown y saltos de línea dobles
-    import re
-    # Primero, separar por títulos markdown
+    # Separar por títulos markdown y saltos dobles de línea
     parts = re.split(r'(?:^|\n)(#+ .+)', text)
-    merged = []
-    buf = ''
+    merged, buf = [], ''
     for part in parts:
         if part.strip().startswith('#'):
             if buf.strip():
@@ -82,7 +91,6 @@ def split():
             buf += '\n' + part
     if buf.strip():
         merged.append(buf.strip())
-    # Si no hay títulos, separar por dobles saltos de línea
     if len(merged) <= 1:
         merged = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
     return jsonify({'parts': merged})
@@ -100,8 +108,7 @@ def tts():
     def process_part(part, filename):
         generate_audio_async(part, filename)
     for part, filename in zip(parts[1:], filenames[1:]):
-        thread = threading.Thread(target=process_part, args=(part, filename))
-        thread.daemon = True
+        thread = threading.Thread(target=process_part, args=(part, filename), daemon=True)
         thread.start()
     audio_urls = [f'/audio/{os.path.basename(f)}' for f in filenames]
     return jsonify({'audio_urls': audio_urls})
@@ -118,7 +125,6 @@ def delete_audio():
     url = request.json.get('url', '')
     filename = url.split('/')[-1]
     filepath = os.path.join(UPLOAD_FOLDER, filename)
-    # En vez de borrar inmediatamente, lo ponemos en la cola
     cleanup_queue.put(filepath)
     return jsonify({'deleted': True})
 
@@ -136,15 +142,13 @@ def clear_cache():
 
 @app.route('/export_all', methods=['POST'])
 def export_all():
-    # Une todos los audios actuales en el cache en orden de creación
     files = [f for f in os.listdir(UPLOAD_FOLDER) if f.endswith('.mp3')]
     files = sorted(files, key=lambda x: os.path.getctime(os.path.join(UPLOAD_FOLDER, x)))
     valid_files = []
     for f in files:
         path = os.path.join(UPLOAD_FOLDER, f)
         try:
-            if os.path.getsize(path) > 1024:  # Solo archivos mayores a 1KB
-                # Prueba si se puede abrir
+            if os.path.getsize(path) > 1024:
                 AudioSegment.from_mp3(path)
                 valid_files.append(f)
         except Exception:
@@ -171,6 +175,7 @@ def repeat_part():
     generate_audio_async(parts[idx], filename)
     return jsonify({'audio_url': f'/audio/{audio_id}.mp3'})
 
+# --- Manejo de PDF ---
 ALLOWED_EXTENSIONS = {'pdf'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -192,18 +197,6 @@ def upload_pdf():
         os.remove(tmp.name)
         return jsonify({'text': text})
     return jsonify({'error': 'Invalid file'}), 400
-
-# Limpieza automática de archivos antiguos (más de 1 hora)
-def clean_old_files():
-    now = time.time()
-    for f in os.listdir(UPLOAD_FOLDER):
-        if f.endswith('.mp3'):
-            path = os.path.join(UPLOAD_FOLDER, f)
-            try:
-                if os.path.getmtime(path) < now - 3600:
-                    os.remove(path)
-            except Exception:
-                pass
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
