@@ -7,6 +7,10 @@ import asyncio
 from pydub import AudioSegment
 from threading import Thread
 from queue import Queue
+from werkzeug.utils import secure_filename
+import tempfile
+import fitz  # PyMuPDF
+import time
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'audio_cache'
@@ -52,6 +56,10 @@ async def tts_edge(text, filename):
 def generate_audio_async(text, filename):
     asyncio.run(tts_edge(text, filename))
 
+@app.before_request
+def before_request():
+    clean_old_files()
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -59,8 +67,25 @@ def index():
 @app.route('/split', methods=['POST'])
 def split():
     text = request.json.get('text', '')
-    parts = split_text(text)
-    return jsonify({'parts': parts})
+    # Mejorar split: separar por títulos markdown y saltos de línea dobles
+    import re
+    # Primero, separar por títulos markdown
+    parts = re.split(r'(?:^|\n)(#+ .+)', text)
+    merged = []
+    buf = ''
+    for part in parts:
+        if part.strip().startswith('#'):
+            if buf.strip():
+                merged.append(buf.strip())
+            buf = part.strip()
+        else:
+            buf += '\n' + part
+    if buf.strip():
+        merged.append(buf.strip())
+    # Si no hay títulos, separar por dobles saltos de línea
+    if len(merged) <= 1:
+        merged = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
+    return jsonify({'parts': merged})
 
 @app.route('/tts', methods=['POST'])
 def tts():
@@ -133,6 +158,52 @@ def export_all():
     export_path = os.path.join(UPLOAD_FOLDER, f'export_{export_id}.mp3')
     combined.export(export_path, format="mp3")
     return jsonify({'export_url': f'/audio/{os.path.basename(export_path)}'})
+
+@app.route('/repeat_part', methods=['POST'])
+def repeat_part():
+    idx = request.json.get('idx')
+    text = request.json.get('text')
+    parts = split_text(text)
+    if idx is None or idx < 0 or idx >= len(parts):
+        return jsonify({'error': 'Índice fuera de rango'}), 400
+    audio_id = str(uuid.uuid4())
+    filename = os.path.join(UPLOAD_FOLDER, f'{audio_id}.mp3')
+    generate_audio_async(parts[idx], filename)
+    return jsonify({'audio_url': f'/audio/{audio_id}.mp3'})
+
+ALLOWED_EXTENSIONS = {'pdf'}
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/upload_pdf', methods=['POST'])
+def upload_pdf():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            file.save(tmp.name)
+            doc = fitz.open(tmp.name)
+            text = "\n\n".join([page.get_text("text") for page in doc])
+            doc.close()
+        os.remove(tmp.name)
+        return jsonify({'text': text})
+    return jsonify({'error': 'Invalid file'}), 400
+
+# Limpieza automática de archivos antiguos (más de 1 hora)
+def clean_old_files():
+    now = time.time()
+    for f in os.listdir(UPLOAD_FOLDER):
+        if f.endswith('.mp3'):
+            path = os.path.join(UPLOAD_FOLDER, f)
+            try:
+                if os.path.getmtime(path) < now - 3600:
+                    os.remove(path)
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')

@@ -1,3 +1,5 @@
 edge-tts
 flask
 pydub
+fitz
+werkzeug
