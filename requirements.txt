@@ -1,5 +1,5 @@
 edge-tts
 flask
 pydub
-fitz
+PyMuPDF
 werkzeug
