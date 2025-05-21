@@ -67,6 +67,23 @@ async def tts_edge(text, filename):
 def generate_audio_async(text, filename):
     asyncio.run(tts_edge(text, filename))
 
+def get_text_parts(text):
+    # Replica la lógica de /split para dividir el texto en partes
+    parts = re.split(r'(?:^|\n)(#+ .+)', text)
+    merged, buf = [], ''
+    for part in parts:
+        if part.strip().startswith('#'):
+            if buf.strip():
+                merged.append(buf.strip())
+            buf = part.strip()
+        else:
+            buf += '\n' + part
+    if buf.strip():
+        merged.append(buf.strip())
+    if len(merged) <= 1:
+        merged = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
+    return merged
+
 # --- Rutas Flask ---
 @app.before_request
 def before_request():
@@ -98,7 +115,7 @@ def split():
 @app.route('/tts', methods=['POST'])
 def tts():
     text = request.json.get('text', '')
-    parts = split_text(text)
+    parts = get_text_parts(text)
     audio_ids = [str(uuid.uuid4()) for _ in parts]
     filenames = [os.path.join(UPLOAD_FOLDER, f'{audio_id}.mp3') for audio_id in audio_ids]
     # Procesar la primera parte de forma síncrona
@@ -167,7 +184,7 @@ def export_all():
 def repeat_part():
     idx = request.json.get('idx')
     text = request.json.get('text')
-    parts = split_text(text)
+    parts = get_text_parts(text)
     if idx is None or idx < 0 or idx >= len(parts):
         return jsonify({'error': 'Índice fuera de rango'}), 400
     audio_id = str(uuid.uuid4())
