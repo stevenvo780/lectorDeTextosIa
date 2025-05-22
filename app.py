@@ -65,9 +65,18 @@ async def tts_edge(text, filename):
     await communicate.save(filename)
 
 def generate_audio_async(text, filename):
-    asyncio.run(tts_edge(text, filename))
+    try:
+        asyncio.run(tts_edge(text, filename))
+    except Exception as e:
+        # Loguear el error y evitar archivos corruptos
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except Exception:
+                pass
+        print(f"Error generando audio: {e}")
 
-def get_text_parts(text):
+def get_text_parts(text, min_length=5):
     # Replica la lógica de /split para dividir el texto en partes
     parts = re.split(r'(?:^|\n)(#+ .+)', text)
     merged, buf = [], ''
@@ -82,6 +91,8 @@ def get_text_parts(text):
         merged.append(buf.strip())
     if len(merged) <= 1:
         merged = [p.strip() for p in re.split(r'\n\n+', text) if p.strip()]
+    # Filtrar fragmentos vacíos o muy cortos
+    merged = [p for p in merged if len(p.strip()) >= min_length]
     return merged
 
 # --- Rutas Flask ---
@@ -116,6 +127,8 @@ def split():
 def tts():
     text = request.json.get('text', '')
     parts = get_text_parts(text)
+    if not parts:
+        return jsonify({'audio_urls': [], 'error': 'No hay fragmentos válidos para leer.'}), 400
     audio_ids = [str(uuid.uuid4()) for _ in parts]
     filenames = [os.path.join(UPLOAD_FOLDER, f'{audio_id}.mp3') for audio_id in audio_ids]
     # Procesar la primera parte de forma síncrona
@@ -166,14 +179,33 @@ def export_all():
         path = os.path.join(UPLOAD_FOLDER, f)
         try:
             if os.path.getsize(path) > 1024:
+                # Verificar que el archivo no esté corrupto
                 AudioSegment.from_mp3(path)
                 valid_files.append(f)
         except Exception:
             continue
     if not valid_files:
-        return jsonify({'export_url': None})
-    combined = AudioSegment.empty()
+        return jsonify({'export_url': None, 'error': 'No hay audios válidos para exportar.'})
+    # Esperar a que todos los audios estén listos (máx 60s)
+    start = time.time()
+    while True:
+        all_ready = all(os.path.exists(os.path.join(UPLOAD_FOLDER, f)) and os.path.getsize(os.path.join(UPLOAD_FOLDER, f)) > 1024 for f in valid_files)
+        if all_ready or (time.time() - start) > 60:
+            break
+        time.sleep(0.5)
+    # Revalidar
+    valid_files2 = []
     for f in valid_files:
+        path = os.path.join(UPLOAD_FOLDER, f)
+        try:
+            AudioSegment.from_mp3(path)
+            valid_files2.append(f)
+        except Exception:
+            continue
+    if not valid_files2:
+        return jsonify({'export_url': None, 'error': 'No hay audios válidos para exportar.'})
+    combined = AudioSegment.empty()
+    for f in valid_files2:
         combined += AudioSegment.from_mp3(os.path.join(UPLOAD_FOLDER, f))
     export_id = str(uuid.uuid4())
     export_path = os.path.join(UPLOAD_FOLDER, f'export_{export_id}.mp3')

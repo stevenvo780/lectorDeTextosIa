@@ -1,5 +1,6 @@
-// app.js - Lógica principal para Lector de Textos IA
-// Modularizado y documentado
+import { AudioPlayer } from './audioPlayer.js';
+import { highlightParagraph, clearHighlight } from './textHighlight.js';
+import { showError, updateStatus } from './uiUtils.js';
 
 // --- Referencias a elementos del DOM ---
 const form = document.getElementById('textForm');
@@ -16,26 +17,57 @@ const nextBtn = document.getElementById('nextBtn');
 const pdfInput = document.getElementById('pdfInput');
 const pdfStatus = document.getElementById('pdfStatus');
 
+// --- Selector de velocidad ---
+let speedSelector = document.getElementById('speedSelector');
+if (!speedSelector) {
+    speedSelector = document.createElement('select');
+    speedSelector.id = 'speedSelector';
+    speedSelector.className = 'form-select my-2';
+    [0.75, 1, 1.25, 1.5, 1.75, 2].forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = `Velocidad ${v}x`;
+        if (v === 1) opt.selected = true;
+        speedSelector.appendChild(opt);
+    });
+    audioContainer.parentNode.insertBefore(speedSelector, audioContainer.nextSibling);
+}
+
 // --- Estado global ---
 let cancelRequested = false;
 let isPaused = false;
 let audioElem = null;
+let audioPlayer = null;
 let current = 0;
 let audios = [];
 let textParts = [];
 
-// --- Utilidades de UI ---
-function showError(msg) {
-    const alert = document.createElement('div');
-    alert.className = 'alert alert-danger alert-dismissible fade show position-fixed';
-    alert.role = 'alert';
-    alert.style = 'bottom: 20px; right: 20px; max-width: 400px; z-index: 9999;';
-    alert.innerHTML = msg + '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>';
-    document.body.appendChild(alert);
-    setTimeout(() => alert.remove(), 6000);
-}
-function updateStatus(message) {
-    statusBar.textContent = message;
+// --- Persistencia con localStorage ---
+window.addEventListener('DOMContentLoaded', () => {
+    const savedText = localStorage.getItem('lector_text');
+    if (savedText) {
+        textInput.value = savedText;
+    }
+    const savedCurrent = localStorage.getItem('lector_current');
+    if (savedCurrent) {
+        current = parseInt(savedCurrent, 10) || 0;
+    }
+    const savedParts = localStorage.getItem('lector_parts');
+    if (savedParts) {
+        try {
+            textParts = JSON.parse(savedParts);
+        } catch {}
+    }
+});
+
+textInput.addEventListener('input', () => {
+    localStorage.setItem('lector_text', textInput.value);
+});
+
+// Guardar el estado de reproducción
+function savePlaybackState() {
+    localStorage.setItem('lector_current', current);
+    localStorage.setItem('lector_parts', JSON.stringify(textParts));
 }
 
 // --- Procesamiento de texto ---
@@ -63,46 +95,6 @@ function getPartsFromText(text) {
     return parts;
 }
 
-// --- Resaltado de texto ---
-function highlightParagraph(paragraphIndex) {
-    if (!textParts.length || paragraphIndex >= textParts.length) return;
-    const fullText = textInput.value;
-    const partToHighlight = textParts[paragraphIndex];
-    const startPos = fullText.indexOf(partToHighlight);
-    if (startPos === -1) return;
-    const beforeText = fullText.substring(0, startPos);
-    const highlightedPart = partToHighlight;
-    const afterText = fullText.substring(startPos + highlightedPart.length);
-    highlightOverlay.innerHTML = '';
-    if (beforeText) {
-        const beforeSpan = document.createElement('span');
-        beforeSpan.textContent = beforeText;
-        highlightOverlay.appendChild(beforeSpan);
-    }
-    const highlightSpan = document.createElement('span');
-    highlightSpan.className = 'highlight';
-    highlightSpan.textContent = highlightedPart;
-    highlightOverlay.appendChild(highlightSpan);
-    if (afterText) {
-        const afterSpan = document.createElement('span');
-        afterSpan.textContent = afterText;
-        highlightOverlay.appendChild(afterSpan);
-    }
-    // Scroll automático
-    const textAreaHeight = textInput.clientHeight;
-    const lineHeight = parseInt(window.getComputedStyle(textInput).lineHeight);
-    const linesInView = Math.floor(textAreaHeight / lineHeight);
-    const beforeLines = beforeText.split('\n').length;
-    const highlightedLines = highlightedPart.split('\n').length;
-    const currentScrollPos = textInput.scrollTop / lineHeight;
-    if (beforeLines < currentScrollPos || beforeLines + highlightedLines > currentScrollPos + linesInView) {
-        textInput.scrollTop = lineHeight * (beforeLines - 2);
-    }
-    updateStatus(`Reproduciendo parte ${paragraphIndex + 1} de ${textParts.length}`);
-}
-function clearHighlight() {
-    highlightOverlay.innerHTML = '';
-}
 function jumpToPart(idx) {
     if (idx >= 0 && idx < textParts.length && audios.length && idx < audios.length) {
         current = idx;
@@ -119,18 +111,19 @@ textInput.addEventListener('scroll', () => {
 // --- Botones de control ---
 cancelBtn.onclick = async () => {
     cancelRequested = true;
-    clearHighlight();
+    clearHighlight(highlightOverlay);
     audioContainer.innerHTML = '';
     if (audioElem) audioElem.pause();
-    updateStatus('Lectura cancelada');
+    updateStatus(statusBar, 'Lectura cancelada');
     textInput.readOnly = false;
+    textInput.classList.remove('reading-locked');
     await fetch('/clear_cache', { method: 'POST' });
 };
 exportBtn.onclick = async () => {
     exportBtn.disabled = true;
     const originalText = exportBtn.innerHTML;
     exportBtn.innerHTML = `<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Exportando...`;
-    updateStatus('Exportando audio...');
+    updateStatus(statusBar, 'Exportando audio...');
     const res = await fetch('/export_all', { method: 'POST' });
     const data = await res.json();
     exportBtn.disabled = false;
@@ -140,9 +133,9 @@ exportBtn.onclick = async () => {
         a.href = data.export_url;
         a.download = 'lectura_completa.mp3';
         a.click();
-        updateStatus('Audio exportado con éxito');
+        updateStatus(statusBar, 'Audio exportado con éxito');
     } else {
-        updateStatus('Error al exportar el audio');
+        updateStatus(statusBar, 'Error al exportar el audio');
         showError('No se pudo exportar el audio.');
     }
 };
@@ -152,7 +145,7 @@ pauseBtn.onclick = () => {
         isPaused = true;
         pauseBtn.style.display = 'none';
         resumeBtn.style.display = '';
-        updateStatus('Reproducción pausada');
+        updateStatus(statusBar, 'Reproducción pausada');
     }
 };
 resumeBtn.onclick = () => {
@@ -161,7 +154,7 @@ resumeBtn.onclick = () => {
         isPaused = false;
         pauseBtn.style.display = '';
         resumeBtn.style.display = 'none';
-        updateStatus(`Reproduciendo parte ${current + 1} de ${textParts.length}`);
+        updateStatus(statusBar, `Reproduciendo parte ${current + 1} de ${textParts.length}`);
     }
 };
 prevBtn.onclick = () => {
@@ -231,20 +224,22 @@ document.addEventListener('keydown', function(e) {
 form.onsubmit = async (e) => {
     e.preventDefault();
     textInput.readOnly = true;
+    textInput.classList.add('reading-locked');
     cancelRequested = false;
     isPaused = false;
     pauseBtn.style.display = '';
     resumeBtn.style.display = 'none';
     audioContainer.innerHTML = '';
-    clearHighlight();
+    clearHighlight(highlightOverlay);
     await fetch('/clear_cache', { method: 'POST' });
     const text = textInput.value.trim();
     if (!text) {
         showError('Por favor ingresa texto para leer');
         textInput.readOnly = false;
+        textInput.classList.remove('reading-locked');
         return;
     }
-    updateStatus('Procesando texto...');
+    updateStatus(statusBar, 'Procesando texto...');
     // 1. Pedir fragmentos reales al backend
     let splitData;
     try {
@@ -256,14 +251,16 @@ form.onsubmit = async (e) => {
         splitData = await splitRes.json();
     } catch (err) {
         showError('Error de conexión con el servidor (split).');
-        updateStatus('Error de conexión.');
+        updateStatus(statusBar, 'Error de conexión.');
         textInput.readOnly = false;
+        textInput.classList.remove('reading-locked');
         return;
     }
     if (!splitData.parts || !splitData.parts.length) {
         showError('No se pudo dividir el texto.');
-        updateStatus('No se pudo dividir el texto.');
+        updateStatus(statusBar, 'No se pudo dividir el texto.');
         textInput.readOnly = false;
+        textInput.classList.remove('reading-locked');
         return;
     }
     textParts = splitData.parts;
@@ -278,18 +275,23 @@ form.onsubmit = async (e) => {
         data = await res.json();
     } catch (err) {
         showError('Error de conexión con el servidor.');
-        updateStatus('Error de conexión.');
+        updateStatus(statusBar, 'Error de conexión.');
         textInput.readOnly = false;
+        textInput.classList.remove('reading-locked');
         return;
     }
     if (!data.audio_urls || !data.audio_urls.length) {
         showError('No se pudo generar el audio.');
-        updateStatus('No se pudo generar el audio.');
+        updateStatus(statusBar, 'No se pudo generar el audio.');
         textInput.readOnly = false;
+        textInput.classList.remove('reading-locked');
         return;
     }
     current = 0;
     audios = data.audio_urls;
+    localStorage.setItem('lector_text', textInput.value);
+    localStorage.setItem('lector_current', 0);
+    localStorage.setItem('lector_parts', JSON.stringify(textParts));
     audioElem = document.getElementById('mainAudio');
     if (!audioElem) {
         audioElem = document.createElement('audio');
@@ -298,8 +300,24 @@ form.onsubmit = async (e) => {
         audioElem.style.width = '100%';
         audioContainer.appendChild(audioElem);
     }
+    audioPlayer = new AudioPlayer(audioElem, async () => {
+        if (isPaused) return;
+        if (current < audios.length) {
+            await fetch('/delete_audio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: audios[current] })
+            });
+        }
+        current++;
+        playNext();
+    });
+    audioPlayer.setSpeed(Number(speedSelector.value));
+    speedSelector.onchange = () => {
+        audioPlayer.setSpeed(Number(speedSelector.value));
+    };
     async function waitForAudio(url) {
-        updateStatus('Preparando audio...');
+        updateStatus(statusBar, 'Preparando audio...');
         for (let i = 0; i < 60; i++) {
             if (cancelRequested) return false;
             try {
@@ -313,35 +331,25 @@ form.onsubmit = async (e) => {
     window.playNext = async function playNext() {
         if (cancelRequested) return;
         if (current < audios.length && current < textParts.length) {
-            highlightParagraph(current);
-            updateStatus(`Cargando parte ${current + 1} de ${textParts.length}...`);
+            highlightParagraph(textInput, highlightOverlay, textParts, current);
+            updateStatus(statusBar, `Cargando parte ${current + 1} de ${textParts.length}...`);
             const url = audios[current];
             const ready = await waitForAudio(url);
             if (ready) {
-                audioElem.src = url;
-                audioElem.play();
-                updateStatus(`Reproduciendo parte ${current + 1} de ${textParts.length}`);
+                audioPlayer.setSource(url);
+                audioPlayer.play();
+                updateStatus(statusBar, `Reproduciendo parte ${current + 1} de ${textParts.length}`);
             } else {
-                updateStatus(`Error al cargar la parte ${current + 1}`);
+                updateStatus(statusBar, `Error al cargar la parte ${current + 1}`);
                 audioContainer.insertAdjacentHTML('beforeend', `<div class='text-danger mb-2'>No se pudo cargar el audio para la parte ${current + 1}.</div>`);
             }
         } else if (current >= audios.length) {
-            clearHighlight();
-            updateStatus('Reproducción completada');
+            clearHighlight(highlightOverlay);
+            updateStatus(statusBar, 'Reproducción completada');
             textInput.readOnly = false;
+            textInput.classList.remove('reading-locked');
         }
-    }
-    audioElem.onended = async () => {
-        if (isPaused) return;
-        if (current < audios.length) {
-            await fetch('/delete_audio', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: audios[current] })
-            });
-        }
-        current++;
-        playNext();
+        savePlaybackState();
     };
     playNext();
 };
@@ -351,7 +359,7 @@ pdfInput.onchange = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     pdfStatus.textContent = 'Analizando PDF...';
-    updateStatus('Procesando archivo PDF...');
+    updateStatus(statusBar, 'Procesando archivo PDF...');
     const formData = new FormData();
     formData.append('file', file);
     try {
@@ -363,16 +371,20 @@ pdfInput.onchange = async (e) => {
         if (data.text) {
             textInput.value = data.text;
             pdfStatus.textContent = 'PDF cargado con éxito';
-            updateStatus('PDF cargado. Listo para reproducir.');
+            updateStatus(statusBar, 'PDF cargado. Listo para reproducir.');
         } else {
             pdfStatus.textContent = 'No se pudo leer el PDF.';
-            updateStatus('Error al procesar el PDF');
+            updateStatus(statusBar, 'Error al procesar el PDF');
             showError('No se pudo extraer el texto del PDF.');
         }
     } catch (error) {
         pdfStatus.textContent = 'Error al procesar el PDF.';
-        updateStatus('Error al procesar el PDF');
+        updateStatus(statusBar, 'Error al procesar el PDF');
         showError('Error al procesar el archivo PDF.');
         console.error(error);
     }
 };
+
+window.addEventListener('beforeunload', () => {
+    savePlaybackState();
+});
