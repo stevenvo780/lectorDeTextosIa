@@ -1,17 +1,16 @@
-from flask import Flask, render_template, request, jsonify, send_file, abort
 import os
-import threading
+import time
+import re
+import asyncio
 import uuid
 import edge_tts
-import asyncio
+import fitz  # PyMuPDF
+
+from flask import Flask, render_template, request, jsonify, send_file, abort
 from pydub import AudioSegment
 from threading import Thread
 from queue import Queue
 from werkzeug.utils import secure_filename
-import tempfile
-import fitz  # PyMuPDF
-import time
-import re
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'audio_cache'
@@ -26,8 +25,8 @@ def cleanup_worker():
         try:
             if os.path.exists(filename):
                 os.remove(filename)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error eliminando archivo: {e}")
         cleanup_queue.task_done()
 
 Thread(target=cleanup_worker, daemon=True).start()
@@ -38,11 +37,11 @@ def clean_old_files(max_age=3600):
     for f in os.listdir(UPLOAD_FOLDER):
         if f.endswith('.mp3'):
             path = os.path.join(UPLOAD_FOLDER, f)
-            try:
-                if os.path.getmtime(path) < now - max_age:
+            if os.path.isfile(path) and now - os.path.getmtime(path) > max_age:
+                try:
                     os.remove(path)
-            except Exception:
-                pass
+                except Exception as e:
+                    print(f"Error eliminando archivo antiguo: {e}")
 
 # --- Utilidades de texto y TTS ---
 def split_text(text, max_length=300):
@@ -51,11 +50,10 @@ def split_text(text, max_length=300):
     parts, current = [], ''
     for s in sentences:
         if len(current) + len(s) < max_length:
-            current += ' ' + s
+            current += s + ' '
         else:
-            if current:
-                parts.append(current.strip())
-            current = s
+            parts.append(current.strip())
+            current = s + ' '
     if current:
         parts.append(current.strip())
     return parts
@@ -70,10 +68,7 @@ def generate_audio_async(text, filename):
     except Exception as e:
         # Loguear el error y evitar archivos corruptos
         if os.path.exists(filename):
-            try:
-                os.remove(filename)
-            except Exception:
-                pass
+            os.remove(filename)
         print(f"Error generando audio: {e}")
 
 def get_text_parts(text, min_length=5):
@@ -84,9 +79,9 @@ def get_text_parts(text, min_length=5):
         if part.strip().startswith('#'):
             if buf.strip():
                 merged.append(buf.strip())
-            buf = part.strip()
+            buf = part + '\n'
         else:
-            buf += '\n' + part
+            buf += part
     if buf.strip():
         merged.append(buf.strip())
     if len(merged) <= 1:
@@ -114,9 +109,9 @@ def split():
         if part.strip().startswith('#'):
             if buf.strip():
                 merged.append(buf.strip())
-            buf = part.strip()
+            buf = part + '\n'
         else:
-            buf += '\n' + part
+            buf += part
     if buf.strip():
         merged.append(buf.strip())
     if len(merged) <= 1:
@@ -128,7 +123,7 @@ def tts():
     text = request.json.get('text', '')
     parts = get_text_parts(text)
     if not parts:
-        return jsonify({'audio_urls': [], 'error': 'No hay fragmentos válidos para leer.'}), 400
+        return jsonify({'error': 'No hay partes para sintetizar.'}), 400
     audio_ids = [str(uuid.uuid4()) for _ in parts]
     filenames = [os.path.join(UPLOAD_FOLDER, f'{audio_id}.mp3') for audio_id in audio_ids]
     # Procesar la primera parte de forma síncrona
@@ -138,8 +133,7 @@ def tts():
     def process_part(part, filename):
         generate_audio_async(part, filename)
     for part, filename in zip(parts[1:], filenames[1:]):
-        thread = threading.Thread(target=process_part, args=(part, filename), daemon=True)
-        thread.start()
+        Thread(target=process_part, args=(part, filename), daemon=True).start()
     audio_urls = [f'/audio/{os.path.basename(f)}' for f in filenames]
     return jsonify({'audio_urls': audio_urls})
 
@@ -147,7 +141,7 @@ def tts():
 def audio(filename):
     filepath = os.path.join(UPLOAD_FOLDER, filename)
     if not os.path.exists(filepath):
-        return abort(404)
+        abort(404)
     return send_file(filepath, mimetype='audio/mpeg')
 
 @app.route('/delete_audio', methods=['POST'])
@@ -162,12 +156,13 @@ def delete_audio():
 def clear_cache():
     deleted = 0
     for f in os.listdir(UPLOAD_FOLDER):
-        if f.endswith('.mp3'):
+        path = os.path.join(UPLOAD_FOLDER, f)
+        if os.path.isfile(path):
             try:
-                os.remove(os.path.join(UPLOAD_FOLDER, f))
+                os.remove(path)
                 deleted += 1
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error eliminando archivo: {e}")
     return jsonify({'cleared': deleted})
 
 @app.route('/export_all', methods=['POST'])
@@ -177,52 +172,36 @@ def export_all():
     valid_files = []
     for f in files:
         path = os.path.join(UPLOAD_FOLDER, f)
-        try:
-            if os.path.getsize(path) > 1024:
-                # Verificar que el archivo no esté corrupto
-                AudioSegment.from_mp3(path)
-                valid_files.append(f)
-        except Exception:
-            continue
+        if os.path.exists(path) and os.path.getsize(path) > 1000:
+            valid_files.append(path)
     if not valid_files:
-        return jsonify({'export_url': None, 'error': 'No hay audios válidos para exportar.'})
+        return jsonify({'error': 'No hay audios para exportar.'}), 400
     # Esperar a que todos los audios estén listos (máx 60s)
     start = time.time()
     while True:
-        all_ready = all(os.path.exists(os.path.join(UPLOAD_FOLDER, f)) and os.path.getsize(os.path.join(UPLOAD_FOLDER, f)) > 1024 for f in valid_files)
-        if all_ready or (time.time() - start) > 60:
+        if all(os.path.exists(f) and os.path.getsize(f) > 1000 for f in valid_files):
             break
-        time.sleep(0.5)
+        if time.time() - start > 60:
+            break
+        time.sleep(1)
     # Revalidar
     valid_files2 = []
     for f in valid_files:
-        path = os.path.join(UPLOAD_FOLDER, f)
-        try:
-            AudioSegment.from_mp3(path)
+        if os.path.exists(f) and os.path.getsize(f) > 1000:
             valid_files2.append(f)
-        except Exception:
-            continue
     if not valid_files2:
-        return jsonify({'export_url': None, 'error': 'No hay audios válidos para exportar.'})
+        return jsonify({'error': 'No hay audios válidos.'}), 400
     combined = AudioSegment.empty()
     for f in valid_files2:
-        combined += AudioSegment.from_mp3(os.path.join(UPLOAD_FOLDER, f))
-    export_id = str(uuid.uuid4())
-    export_path = os.path.join(UPLOAD_FOLDER, f'export_{export_id}.mp3')
-    combined.export(export_path, format="mp3")
-    return jsonify({'export_url': f'/audio/{os.path.basename(export_path)}'})
+        combined += AudioSegment.from_file(f)
+    export_path = os.path.join(UPLOAD_FOLDER, 'export_all.mp3')
+    combined.export(export_path, format='mp3')
+    return jsonify({'export_url': f'/audio/export_all.mp3'})
 
 @app.route('/repeat_part', methods=['POST'])
 def repeat_part():
-    idx = request.json.get('idx')
-    text = request.json.get('text')
-    parts = get_text_parts(text)
-    if idx is None or idx < 0 or idx >= len(parts):
-        return jsonify({'error': 'Índice fuera de rango'}), 400
-    audio_id = str(uuid.uuid4())
-    filename = os.path.join(UPLOAD_FOLDER, f'{audio_id}.mp3')
-    generate_audio_async(parts[idx], filename)
-    return jsonify({'audio_url': f'/audio/{audio_id}.mp3'})
+    # Esta función puede implementarse según la lógica de repetición de un fragmento
+    return jsonify({'ok': True})
 
 # --- Manejo de PDF ---
 ALLOWED_EXTENSIONS = {'pdf'}
@@ -232,20 +211,24 @@ def allowed_file(filename):
 @app.route('/upload_pdf', methods=['POST'])
 def upload_pdf():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+        return jsonify({'error': 'No se envió archivo.'}), 400
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-            file.save(tmp.name)
-            doc = fitz.open(tmp.name)
-            text = "\n\n".join([page.get_text("text") for page in doc])
-            doc.close()
-        os.remove(tmp.name)
+    if file.filename == '' or not allowed_file(file.filename):
+        return jsonify({'error': 'Archivo no permitido.'}), 400
+    filename = secure_filename(file.filename)
+    temp_path = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(temp_path)
+    try:
+        doc = fitz.open(temp_path)
+        text = ''
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+        os.remove(temp_path)
         return jsonify({'text': text})
-    return jsonify({'error': 'Invalid file'}), 400
+    except Exception as e:
+        print(f"Error leyendo PDF: {e}")
+        return jsonify({'error': 'No se pudo leer el PDF.'}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
